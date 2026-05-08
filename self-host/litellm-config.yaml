@@ -1,0 +1,45 @@
+model_list:
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openai/claude-opus-4-7
+      api_base: http://auth2api:8317/v1
+      api_key: "os.environ/AUTH2API_PASSTHROUGH_KEY"
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/claude-sonnet-4-6
+      api_base: http://auth2api:8317/v1
+      api_key: "os.environ/AUTH2API_PASSTHROUGH_KEY"
+
+  # Routed through auth2api -> Codex (OpenAI ChatGPT subscription).
+  # auth2api-known OpenAI models (from /v1/models): gpt-5.5, gpt-5.4,
+  # gpt-5.4-mini, gpt-5.3-codex, gpt-5.2. Plain "gpt-5" is rejected by Codex
+  # for ChatGPT-account users.
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_base: http://auth2api:8317/v1
+      api_key: "os.environ/AUTH2API_PASSTHROUGH_KEY"
+
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/gpt-5.4
+      api_base: http://auth2api:8317/v1
+      api_key: "os.environ/AUTH2API_PASSTHROUGH_KEY"
+
+  # Slot reserved for an open-weight model substitution.
+  # Edit api_base/api_key/model to point at your open-weight backend
+  # (Ollama, vLLM, etc.). Until then, requests to this model will fail.
+  # - model_name: claude-haiku-4-5-20251001
+  #   litellm_params:
+  #     model: openai/<your-open-weight-model>
+  #     api_base: http://<your-backend-host>:<port>/v1
+  #     api_key: "os.environ/OPEN_WEIGHT_API_KEY"
+
+litellm_settings:
+  success_callback: ["posthog"]
+  failure_callback: ["posthog"]
+  drop_params: true
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"

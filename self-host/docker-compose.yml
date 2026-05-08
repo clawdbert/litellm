@@ -1,0 +1,124 @@
+# Shared config block for the two auth2api variants (daemon + login).
+# Anchors avoid duplicating the entrypoint-templating script across both.
+x-auth2api-base: &auth2api-base
+  build:
+    context: .
+    dockerfile: Dockerfile.auth2api
+  image: auth2api:pinned
+  # Render config.yaml from the template at start time (substituting the
+  # passthrough key from the env), then exec node with whatever extra args
+  # were passed. No extra args -> daemon. "--login" -> interactive OAuth.
+  # $$ escapes Compose-level interpolation so the shell sees $.
+  entrypoint:
+    - sh
+    - -c
+    - |
+      set -e
+      : "$${AUTH2API_PASSTHROUGH_KEY:?AUTH2API_PASSTHROUGH_KEY must be set}"
+      mkdir -p /config
+      sed "s|\$${AUTH2API_PASSTHROUGH_KEY}|$${AUTH2API_PASSTHROUGH_KEY}|g" \
+        /config-template/config.yaml > /config/config.yaml
+      exec node dist/index.js --config=/config/config.yaml "$$@"
+    - --
+  environment:
+    - AUTH2API_PASSTHROUGH_KEY=${AUTH2API_PASSTHROUGH_KEY}
+    - NODE_ENV=production
+  volumes:
+    - ./auth2api-config.yaml:/config-template/config.yaml:ro
+    - ./auth2api-data:/data
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env before first up}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gateway
+    restart: unless-stopped
+    healthcheck:
+      # pg_isready confirms the server is accepting connections (ready),
+      # not merely that the container is running.
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  auth2api:
+    <<: *auth2api-base
+    networks:
+      - gateway
+    restart: unless-stopped
+    healthcheck:
+      # node:20-alpine ships busybox nc; -z confirms TCP listener (ready to accept).
+      # Use 127.0.0.1 explicitly because "localhost" sometimes resolves via IPv6
+      # in alpine and auth2api binds IPv4 only.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8317"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # Profile-gated one-shot for the OAuth login flow. auth2api binds the
+  # callback listener to 127.0.0.1:54545 (hardcoded upstream), so this
+  # variant uses network_mode: host so the browser's redirect to
+  # localhost:54545 reaches the same loopback the container is binding.
+  # Run with: podman compose --profile login run --rm -it auth2api-login --login
+  auth2api-login:
+    <<: *auth2api-base
+    profiles: ["login"]
+    network_mode: host
+
+  litellm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: litellm-posthog:local
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - STORE_MODEL_IN_DB=True
+      - POSTHOG_API_KEY=${POSTHOG_API_KEY}
+      - POSTHOG_API_URL=${POSTHOG_API_URL}
+      - AUTH2API_PASSTHROUGH_KEY=${AUTH2API_PASSTHROUGH_KEY}
+      # Public URL the proxy is reachable at (tailscale serve termination point).
+      # Used by the UI to emit absolute https:// links.
+      - PROXY_BASE_URL=${PROXY_BASE_URL:-}
+      # uvicorn trusts X-Forwarded-Proto only from this list. Default 127.0.0.1
+      # is too narrow when traffic comes from the docker bridge gateway.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      db:
+        condition: service_healthy
+      auth2api:
+        condition: service_healthy
+    networks:
+      - gateway
+    restart: unless-stopped
+    healthcheck:
+      # /health/readiness checks DB + dependencies; /health/liveliness only checks process.
+      # We want ready, so /health/readiness.
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/readiness',timeout=5).status==200 else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+networks:
+  gateway:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: litellm_self_host_postgres_data
