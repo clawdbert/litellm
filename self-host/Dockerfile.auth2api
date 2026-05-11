@@ -1,0 +1,22 @@
+# auth2api has no published image and no semver tags. Pin to a commit SHA.
+# Update AUTH2API_SHA to bump. Verify the SHA at https://github.com/amazingang/auth2api/commits/main
+ARG AUTH2API_SHA=aa087c3cfa7b9b028817cdf2ab9a185310e14aba
+
+FROM node:20-alpine AS builder
+ARG AUTH2API_SHA
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git clone https://github.com/amazingang/auth2api.git . \
+ && git checkout "${AUTH2API_SHA}"
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npx tsc
+
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=builder /src/dist ./dist
+COPY --from=builder /src/node_modules ./node_modules
+COPY --from=builder /src/package.json ./package.json
+EXPOSE 8317
+VOLUME ["/data", "/config"]
+ENV NODE_ENV=production
+CMD ["node", "dist/index.js", "--config=/config/config.yaml"]
