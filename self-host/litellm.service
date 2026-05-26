@@ -1,0 +1,16 @@
+[Unit]
+Description=LiteLLM self-host stack (podman compose)
+Requires=podman.socket
+After=podman.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/deploy/projects/litellm/self-host
+ExecStart=/usr/local/bin/docker-compose up -d
+ExecStop=/usr/local/bin/docker-compose down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

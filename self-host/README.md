@@ -191,6 +191,8 @@ Expected: a JSON response containing `"ok"`.
 
 **Codex model selection.** Plain `gpt-5` is rejected by Codex for ChatGPT-account users with "model not supported when using Codex". The accepted models advertised by auth2api's `/v1/models` are: `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2`. We expose `gpt-5.5` (latest). Edit `litellm-config.yaml` if you need a different one.
 
+**Model name format.** Keep `litellm_params.model` unprefixed and set `custom_llm_provider: openai` for auth2api routes. This still uses LiteLLM's OpenAI-compatible provider path, while keeping downstream logs and tool-use payloads as `claude-*` or `gpt-*` instead of malformed names like `openai/claude-*`.
+
 ### Adding the haiku slot via UI
 
 `STORE_MODEL_IN_DB=True` is set, so models can be added at runtime via the LiteLLM Admin UI:
