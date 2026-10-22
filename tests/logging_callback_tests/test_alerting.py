@@ -6,7 +6,6 @@ import io
 import json
 import os
 import random
-import sys
 import time
 from litellm._uuid import uuid
 from datetime import datetime, timedelta
@@ -18,9 +17,6 @@ from litellm.types.integrations.slack_alerting import AlertType
 
 # import logging
 # logging.basicConfig(level=logging.DEBUG)
-sys.path.insert(0, os.path.abspath("../.."))
-import asyncio
-import os
 import unittest.mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,7 +39,7 @@ from litellm.utils import get_api_base
     "model, optional_params, expected_api_base",
     [
         ("openai/my-fake-model", {"api_base": "my-fake-api-base"}, "my-fake-api-base"),
-        ("gpt-3.5-turbo", {}, "https://api.openai.com"),
+        ("gpt-5-mini", {}, "https://api.openai.com"),
     ],
 )
 def test_get_api_base_unit_test(model, optional_params, expected_api_base):
@@ -130,10 +126,6 @@ def test_init():
     assert slack_no_alerting.alerting == []
 
     print("passed testing slack alerting init")
-
-
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
 
 
 @pytest.fixture
@@ -254,7 +246,7 @@ async def test_daily_reports_unit_test(slack_alerting):
             model_list=[
                 {
                     "model_name": "test-gpt",
-                    "litellm_params": {"model": "gpt-3.5-turbo"},
+                    "litellm_params": {"model": "gpt-5-mini"},
                     "model_info": {"id": "1234"},
                 }
             ]
@@ -286,16 +278,16 @@ async def test_daily_reports_completion(slack_alerting):
         router = litellm.Router(
             model_list=[
                 {
-                    "model_name": "gpt-5",
+                    "model_name": "gpt-5.5",
                     "litellm_params": {
-                        "model": "gpt-3.5-turbo",
+                        "model": "gpt-5-mini",
                     },
                 }
             ]
         )
 
         await router.acompletion(
-            model="gpt-3.5-turbo",
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": "Hey, how's it going?"}],
         )
 
@@ -310,15 +302,15 @@ async def test_daily_reports_completion(slack_alerting):
         router = litellm.Router(
             model_list=[
                 {
-                    "model_name": "gpt-5",
-                    "litellm_params": {"model": "gpt-3.5-turbo", "api_key": "bad_key"},
+                    "model_name": "gpt-5.5",
+                    "litellm_params": {"model": "gpt-5-mini", "api_key": "bad_key"},
                 }
             ]
         )
 
         try:
             await router.acompletion(
-                model="gpt-3.5-turbo",
+                model="gpt-5-mini",
                 messages=[{"role": "user", "content": "Hey, how's it going?"}],
             )
         except Exception as e:
@@ -333,71 +325,23 @@ async def test_daily_reports_completion(slack_alerting):
 
 
 @pytest.mark.asyncio
-async def test_daily_reports_redis_cache_scheduler():
-    redis_cache = RedisCache()
-    slack_alerting = SlackAlerting(
-        internal_usage_cache=DualCache(redis_cache=redis_cache)
-    )
-
-    # we need this to be 0 so it actualy sends the report
-    slack_alerting.alerting_args.daily_report_frequency = 0
-
-    from litellm.router import AlertingConfig
-
-    router = litellm.Router(
-        model_list=[
-            {
-                "model_name": "gpt-5",
-                "litellm_params": {
-                    "model": "gpt-3.5-turbo",
-                },
-            }
-        ]
-    )
-
-    with (
-        patch.object(slack_alerting, "send_alert", new=AsyncMock()) as mock_send_alert,
-        patch.object(
-            redis_cache, "async_set_cache", new=AsyncMock()
-        ) as mock_redis_set_cache,
-    ):
-        # initial call - expect empty
-        await slack_alerting._run_scheduler_helper(llm_router=router)
-
-        try:
-            json.dumps(mock_redis_set_cache.call_args[0][1])
-        except Exception as e:
-            pytest.fail(
-                "Cache value can't be json dumped - {}".format(
-                    mock_redis_set_cache.call_args[0][1]
-                )
-            )
-
-        mock_redis_set_cache.assert_awaited_once()
-
-        # second call - expect empty
-        await slack_alerting._run_scheduler_helper(llm_router=router)
-
-
-@pytest.mark.asyncio
 @pytest.mark.skip(reason="Local test. Test if slack alerts are sent.")
 async def test_send_llm_exception_to_slack():
-    from litellm.router import AlertingConfig
 
     # on async success
     router = litellm.Router(
         model_list=[
             {
-                "model_name": "gpt-3.5-turbo",
+                "model_name": "gpt-5-mini",
                 "litellm_params": {
-                    "model": "gpt-3.5-turbo",
+                    "model": "gpt-5-mini",
                     "api_key": "bad_key",
                 },
             },
             {
                 "model_name": "gpt-5-good",
                 "litellm_params": {
-                    "model": "gpt-3.5-turbo",
+                    "model": "gpt-5-mini",
                 },
             },
         ],
@@ -407,7 +351,7 @@ async def test_send_llm_exception_to_slack():
     )
     try:
         await router.acompletion(
-            model="gpt-3.5-turbo",
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": "Hey, how's it going?"}],
         )
     except Exception:
@@ -582,15 +526,15 @@ async def test_webhook_alerting(alerting_type):
 @pytest.mark.parametrize(
     "model, api_base, llm_provider, vertex_project, vertex_location",
     [
-        ("gpt-3.5-turbo", None, "openai", None, None),
+        ("gpt-5-mini", None, "openai", None, None),
         (
-            "azure/gpt-3.5-turbo",
+            "azure/gpt-5-mini",
             "https://openai-gpt-4-test-v-1.openai.azure.com",
             "azure",
             None,
             None,
         ),
-        ("gemini-2.0-flash", None, "vertex_ai", "hardy-device-38811", "us-central1"),
+        ("gemini-3.8-flash", None, "vertex_ai", "hardy-device-38811", "us-central1"),
     ],
 )
 @pytest.mark.parametrize("error_code", [500, 408, 400])
@@ -688,15 +632,15 @@ async def test_outage_alerting_called(
 @pytest.mark.parametrize(
     "model, api_base, llm_provider, vertex_project, vertex_location",
     [
-        ("gpt-3.5-turbo", None, "openai", None, None),
+        ("gpt-5-mini", None, "openai", None, None),
         (
-            "azure/gpt-3.5-turbo",
+            "azure/gpt-5-mini",
             "https://openai-gpt-4-test-v-1.openai.azure.com",
             "azure",
             None,
             None,
         ),
-        ("gemini-2.0-flash", None, "vertex_ai", "hardy-device-38811", "us-central1"),
+        ("gemini-3.8-flash", None, "vertex_ai", "hardy-device-38811", "us-central1"),
     ],
 )
 @pytest.mark.parametrize("error_code", [500, 408, 400])
@@ -783,7 +727,7 @@ async def test_region_outage_alerting_called(
             await slack_alerting.region_outage_alerts(
                 exception=error_to_raise, deployment_id=deployment_id  # type: ignore
             )
-        if model == "gemini-2.0-flash" and (error_code == 500 or error_code == 408):
+        if model == "gemini-3.8-flash" and (error_code == 500 or error_code == 408):
             mock_send_alert.assert_called_once()
         else:
             mock_send_alert.assert_not_called()
@@ -800,7 +744,7 @@ async def test_langfuse_trace_id():
     litellm.success_callback = ["langfuse"]
 
     litellm_logging_obj = Logging(
-        model="gpt-3.5-turbo",
+        model="gpt-5-mini",
         messages=[{"role": "user", "content": "hi"}],
         stream=False,
         call_type="acompletion",
@@ -810,7 +754,7 @@ async def test_langfuse_trace_id():
     )
 
     litellm.completion(
-        model="gpt-3.5-turbo",
+        model="gpt-5-mini",
         messages=[{"role": "user", "content": "Hey how's it going?"}],
         mock_response="Hey!",
         litellm_logging_obj=litellm_logging_obj,

@@ -1,0 +1,22 @@
+# Bind to all interfaces inside the container so litellm can reach auth2api
+# over the gateway bridge network. The container is not exposed to the host —
+# only litellm (on the same bridge) can reach it.
+host: "0.0.0.0"
+port: 8317
+
+# OAuth tokens live in the bind-mounted /data volume (./auth2api-data/ on host).
+auth-dir: "/data"
+
+# Bearer key clients (i.e. LiteLLM) must present to call this proxy.
+# Filled at container start from AUTH2API_PASSTHROUGH_KEY via envsubst.
+api-keys:
+  - "${AUTH2API_PASSTHROUGH_KEY}"
+
+body-limit: "200mb"
+
+timeouts:
+  messages-ms: 120000
+  stream-messages-ms: 600000
+  count-tokens-ms: 30000
+
+debug: "off"
