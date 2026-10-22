@@ -1,17 +1,25 @@
-import os
-import sys
+import asyncio
 
 import pytest
 
-sys.path.insert(0, os.path.abspath("../.."))
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
-from tests._vcr_conftest_common import (  # noqa: E402
+from tests._vcr_conftest_common import (  # noqa: E402,F401
     VerboseReporterState,
+    _pin_multipart_boundary,
     apply_vcr_auto_marker_to_items,
+    emit_cassette_cache_session_banner,
+    emit_vcr_classification_summary,
+    emit_vcr_diagnostic_log,
+    install_live_call_probe,
     record_vcr_outcome,
     register_persister_if_enabled,
+    reset_vcr_diag_dir,
     vcr_config_dict,
 )
+
+_VCR_INCOMPATIBLE_NODEID_SUFFIXES: tuple[str, ...] = ()
+
 
 _verbose_state = VerboseReporterState()
 
@@ -34,12 +42,29 @@ def pytest_runtest_makereport(item, call):
 
 @pytest.fixture(autouse=True)
 def _vcr_outcome_gate(request, vcr):
+    install_live_call_probe(request, vcr)
     yield
     record_vcr_outcome(request, vcr)
 
 
+@pytest.fixture(autouse=True)
+async def _drain_logging_worker():
+    """
+    The logging queue is bound to the running loop, so anything left queued when a test's loop
+    goes away is carried onto the next loop and fires against that test's callbacks.
+    """
+    GLOBAL_LOGGING_WORKER.start()
+    try:
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+    except asyncio.TimeoutError:
+        pass
+    await GLOBAL_LOGGING_WORKER.stop()
+    yield
+
+
 def pytest_configure(config):
     _verbose_state.remember_pluginmanager(config)
+    reset_vcr_diag_dir()
 
 
 def pytest_runtest_logreport(report):
@@ -47,4 +72,12 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_collection_modifyitems(config, items):
-    apply_vcr_auto_marker_to_items(items)
+    apply_vcr_auto_marker_to_items(
+        items, skip_nodeid_suffixes=_VCR_INCOMPATIBLE_NODEID_SUFFIXES
+    )
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    emit_cassette_cache_session_banner(terminalreporter)
+    emit_vcr_classification_summary(terminalreporter)
+    emit_vcr_diagnostic_log(terminalreporter)
