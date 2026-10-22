@@ -2,21 +2,122 @@
 Unified /v1/messages endpoint - (Anthropic Spec)
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from collections.abc import Mapping
+from typing import Final
 
-from litellm._logging import verbose_proxy_logger
-from litellm.anthropic_interface.exceptions import AnthropicExceptionMapping
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import JsonValue
+
+import litellm
+from litellm.anthropic_interface.exceptions import (
+    AnthropicErrorDetail,
+    AnthropicErrorResponse,
+    AnthropicExceptionMapping,
+)
 from litellm.integrations.custom_guardrail import ModifyResponseException
+from litellm.llms.anthropic.pass_through.context_management import (
+    AnthropicContextManagementError,
+)
+from litellm.llms.base_llm.guardrail_translation.utils import (
+    blocked_response_usage as _blocked_response_usage,
+)
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     create_response,
+    log_llm_api_exception,
+    proxy_exception_from_http_exception,
+    proxy_exception_from_route_error,
+    resolve_litellm_call_id,
 )
+from litellm.proxy.common_utils.error_body_call_id import error_body_call_id
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
-from litellm.types.utils import TokenCountResponse
+from litellm.proxy.common_utils.openai_error_payload import (
+    LITELLM_CALL_ID_HEADER,
+    error_status_code,
+    openai_error_param,
+    openai_error_type,
+    with_litellm_call_id,
+)
+from litellm.proxy.common_utils.token_count_settings import count_source_fields
 
-router = APIRouter()
+router: Final = APIRouter()
+
+
+def _with_provider_specific_fields(exc: ProxyException, detail: AnthropicErrorDetail) -> AnthropicErrorDetail:
+    if not exc.provider_specific_fields:
+        return detail
+    with_fields: Final[AnthropicErrorDetail] = {**detail, "provider_specific_fields": exc.provider_specific_fields}
+    return with_fields
+
+
+def _anthropic_error_detail(
+    exc: ProxyException, detail: AnthropicErrorDetail, call_id: str | None
+) -> AnthropicErrorDetail:
+    if call_id is None:
+        return _with_provider_specific_fields(exc, detail)
+    with_call_id: Final[AnthropicErrorDetail] = {
+        **_with_provider_specific_fields(exc, detail),
+        "litellm_call_id": call_id,
+    }
+    return with_call_id
+
+
+def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSONResponse:
+    from litellm.proxy.proxy_server import (
+        _close_dangling_otel_server_span,  # pyright: ignore[reportPrivateUsage]  # proxy_server keeps the span-close helper private; error JSONResponses returned by the route must stamp the OTel server span like the global ProxyException handler does
+        general_settings_view,
+    )
+
+    status_code: Final = int(exc.code) if exc.code is not None and exc.code.isdigit() else 500
+    _close_dangling_otel_server_span(request, status_code, exc=exc)
+    envelope: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
+        status_code=status_code,
+        raw_message=exc.message,
+        request_id=request.headers.get("x-request-id"),
+    )
+    body_call_id: Final = error_body_call_id(general_settings_view(), exc.headers.get(LITELLM_CALL_ID_HEADER))
+    content: Final[AnthropicErrorResponse] = {
+        **envelope,
+        "error": _anthropic_error_detail(exc, envelope["error"], body_call_id),
+    }
+    return JSONResponse(status_code=status_code, content=content, headers=exc.headers)
+
+
+def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
+    """Remove the OpenAI-flavored `usage.total_tokens` field that LiteLLM
+    injects into Anthropic /v1/messages responses.
+
+    The Anthropic /v1/messages spec only defines:
+        input_tokens, output_tokens, cache_creation_input_tokens,
+        cache_read_input_tokens, cache_creation.{ephemeral_5m,ephemeral_1h}
+    The streaming SSE path (message_delta.usage) already does not include
+    total_tokens; this brings the non-streaming path into the same shape.
+
+    Handles both shapes returned by `base_process_llm_request`:
+    - plain `dict` (most common — `AnthropicMessagesResponse` is a TypedDict
+      and is `dict` at runtime)
+    - Pydantic model whose `usage` attribute is dict-shaped (e.g. a
+      BaseModel that holds raw Anthropic usage as a `dict[str, int]`)
+
+    Streaming results (StreamingResponse, AsyncIterator, etc.) and Pydantic
+    models with strongly-typed Usage sub-models are left untouched —
+    those paths either have separate serialization handling or impose
+    type constraints the helper does not try to subvert.
+    """
+    if response is None:
+        return
+    if isinstance(response, dict):
+        usage = response.get("usage")
+        if isinstance(usage, dict) and "total_tokens" in usage:
+            usage.pop("total_tokens", None)
+        return
+    # Pydantic-model fallback: only mutate if `usage` is a dict.
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, dict) and "total_tokens" in usage:
+        usage.pop("total_tokens", None)
 
 
 @router.post(
@@ -24,7 +125,7 @@ router = APIRouter()
     tags=["[beta] Anthropic `/v1/messages`"],
     dependencies=[Depends(user_api_key_auth)],
 )
-async def anthropic_response(  # noqa: PLR0915
+async def anthropic_response(
     fastapi_response: Response,
     request: Request,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
@@ -47,10 +148,10 @@ async def anthropic_response(  # noqa: PLR0915
         version,
     )
 
-    data = await _read_request_body(request=request)
-    base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
+    data: Final = await _read_request_body(request=request)
+    base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
-        result = await base_llm_response_processor.base_process_llm_request(
+        result: Final = await base_llm_response_processor.base_process_llm_request(
             request=request,
             fastapi_response=fastapi_response,
             user_api_key_dict=user_api_key_dict,
@@ -68,10 +169,22 @@ async def anthropic_response(  # noqa: PLR0915
             user_api_base=user_api_base,
             version=version,
         )
+        # Optionally strip the non-Anthropic `usage.total_tokens` field
+        # LiteLLM adds internally. Anthropic's official /v1/messages spec
+        # only defines input_tokens / output_tokens / cache_*_input_tokens;
+        # total_tokens is an OpenAI convention. Default off
+        # (`litellm.strip_anthropic_total_tokens = False`) to preserve
+        # backward compatibility for clients that currently read it; set
+        # to True to align the wire response with the spec (and with the
+        # streaming SSE path, which already omits total_tokens).
+        # spend_logs / Prometheus still compute total internally — this
+        # only affects the wire response.
+        if litellm.strip_anthropic_total_tokens:
+            _strip_total_tokens_from_anthropic_response(result)
         return result
     except ModifyResponseException as e:
         # Guardrail flagged content in passthrough mode - return 200 with violation message
-        _data = e.request_data
+        _data: Final = e.request_data
         await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=e,
@@ -83,14 +196,18 @@ async def anthropic_response(  # noqa: PLR0915
 
         from litellm.types.utils import AnthropicMessagesResponse
 
-        _anthropic_response = AnthropicMessagesResponse(
-            id=f"msg_{str(uuid.uuid4())}",
+        # Report the blocked LLM response's real token usage (carried on the
+        # exception) instead of discarding it; zero for pre-call blocks.
+        _usage: Final = _blocked_response_usage(e.original_response)
+
+        _anthropic_response: Final = AnthropicMessagesResponse(
+            id=f"msg_{uuid.uuid4()}",
             type="message",
             role="assistant",
             content=[{"type": "text", "text": e.message}],
             model=e.model,
             stop_reason="end_turn",
-            usage={"input_tokens": 0, "output_tokens": 0},
+            usage=_usage,
         )
 
         if data.get("stream", None) is not None and data["stream"] is True:
@@ -98,13 +215,11 @@ async def anthropic_response(  # noqa: PLR0915
             async def _passthrough_stream_generator():
                 yield _anthropic_response
 
-            selected_data_generator = (
-                ProxyBaseLLMRequestProcessing.async_sse_data_generator(
-                    response=_passthrough_stream_generator(),
-                    user_api_key_dict=user_api_key_dict,
-                    request_data=_data,
-                    proxy_logging_obj=proxy_logging_obj,
-                )
+            selected_data_generator: Final = ProxyBaseLLMRequestProcessing.async_sse_data_generator(
+                response=_passthrough_stream_generator(),
+                user_api_key_dict=user_api_key_dict,
+                request_data=_data,
+                proxy_logging_obj=proxy_logging_obj,
             )
 
             return await create_response(
@@ -114,25 +229,41 @@ async def anthropic_response(  # noqa: PLR0915
             )
 
         return _anthropic_response
+    except AnthropicContextManagementError as e:
+        if e.status_code >= 500:
+            # Server-side polyfill failures hit the failure hook for spend/alert
+            # parity with the generic handler; 4xx validation errors do not.
+            await proxy_logging_obj.post_call_failure_hook(
+                user_api_key_dict=user_api_key_dict,
+                original_exception=e,
+                request_data=base_llm_response_processor.data,
+            )
+        body: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
+            status_code=e.status_code,
+            raw_message=e.message,
+            request_id=request.headers.get("x-request-id"),
+        )
+        return JSONResponse(status_code=e.status_code, content=body)
     except Exception as e:
         await proxy_logging_obj.post_call_failure_hook(
-            user_api_key_dict=user_api_key_dict, original_exception=e, request_data=data
+            user_api_key_dict=user_api_key_dict, original_exception=e, request_data=base_llm_response_processor.data
         )
-        verbose_proxy_logger.exception(
-            "litellm.proxy.proxy_server.anthropic_response(): Exception occured - {}".format(
-                str(e)
+        log_llm_api_exception(e, base_llm_response_processor.litellm_call_id)
+
+        if isinstance(e, ProxyException):
+            return _anthropic_error_json_response(
+                with_litellm_call_id(e, base_llm_response_processor.litellm_call_id), request
             )
-        )
 
         # Extract model_id from request metadata (same as success path)
-        litellm_metadata = data.get("litellm_metadata", {}) or {}
-        model_info = litellm_metadata.get("model_info", {}) or {}
-        model_id = model_info.get("id", "") or ""
+        litellm_metadata: Final = data.get("litellm_metadata", {}) or {}
+        model_info: Final = litellm_metadata.get("model_info", {}) or {}
+        model_id: Final = model_info.get("id", "") or ""
 
         # Get headers
-        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+        headers: Final = ProxyBaseLLMRequestProcessing.get_custom_headers(
             user_api_key_dict=user_api_key_dict,
-            call_id=data.get("litellm_call_id", ""),
+            call_id=base_llm_response_processor.litellm_call_id,
             model_id=model_id,
             version=version,
             response_cost=0,
@@ -142,14 +273,28 @@ async def anthropic_response(  # noqa: PLR0915
             litellm_logging_obj=None,
         )
 
-        error_msg = f"{str(e)}"
-        raise ProxyException(
-            message=getattr(e, "message", error_msg),
-            type=getattr(e, "type", "None"),
-            param=getattr(e, "param", "None"),
-            code=getattr(e, "status_code", 500),
-            headers=headers,
+        if isinstance(e, HTTPException):
+            return _anthropic_error_json_response(proxy_exception_from_http_exception(e, headers), request)
+
+        error_msg: Final = f"{e}"
+        return _anthropic_error_json_response(
+            ProxyException(
+                message=getattr(e, "message", error_msg),
+                type=openai_error_type(e, error_status_code(e, 500)),
+                param=openai_error_param(e),
+                code=error_status_code(e, 500),
+                headers=headers,
+            ),
+            request,
         )
+
+
+def _requested_output_format(data: Mapping[str, JsonValue]) -> JsonValue:
+    output_format: Final = data.get("output_format")
+    output_config: Final = data.get("output_config")
+    if isinstance(output_format, dict) or not isinstance(output_config, dict):
+        return output_format
+    return output_config.get("format")
 
 
 @router.post(
@@ -181,71 +326,48 @@ async def count_tokens(
     
     Returns: {"input_tokens": <number>}
     """
-    from litellm.proxy.proxy_server import token_counter as internal_token_counter
+    from litellm.proxy.proxy_server import count_request_tokens
 
+    litellm_call_id: Final = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
     try:
-        request_data = await _read_request_body(request=request)
-        data: dict = {**request_data}
+        request_data: Final = await _read_request_body(request=request)
+        data: Final[dict] = {**request_data}
 
         # Extract required fields
-        model_name = data.get("model")
-        messages = data.get("messages", [])
+        model_name: Final = data.get("model")
+        messages: Final = data.get("messages", [])
 
         if not model_name:
-            raise HTTPException(
-                status_code=400, detail={"error": "model parameter is required"}
-            )
+            raise HTTPException(status_code=400, detail="model parameter is required")
 
         if not messages:
-            raise HTTPException(
-                status_code=400, detail={"error": "messages parameter is required"}
-            )
+            raise HTTPException(status_code=400, detail="messages parameter is required")
 
         # Create TokenCountRequest for the internal endpoint
         from litellm.proxy._types import TokenCountRequest
 
-        token_request = TokenCountRequest(
+        token_request: Final = TokenCountRequest(
             model=model_name,
             messages=messages,
             tools=data.get("tools"),
             system=data.get("system"),
         )
 
-        # Call the internal token counter function with direct request flag set to False
-        token_response = await internal_token_counter(
+        token_response: Final = await count_request_tokens(
             request=token_request,
             call_endpoint=True,
+            messages_format="anthropic",
+            output_format=_requested_output_format(data),
         )
-        _token_response_dict: dict = {}
-        if isinstance(token_response, TokenCountResponse):
-            _token_response_dict = token_response.model_dump()
-        elif isinstance(token_response, dict):
-            _token_response_dict = token_response
-
-        # Convert the internal response to Anthropic API format
-        return {"input_tokens": _token_response_dict.get("total_tokens", 0)}
-
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        return _anthropic_error_json_response(proxy_exception_from_http_exception(e, {}), request)
     except ProxyException as e:
-        status_code = int(e.code) if e.code and e.code.isdigit() else 500
-        detail = AnthropicExceptionMapping.transform_to_anthropic_error(
-            status_code=status_code,
-            raw_message=e.message,
-        )
-        raise HTTPException(
-            status_code=status_code,
-            detail=detail,
-        )
+        return _anthropic_error_json_response(e, request)
     except Exception as e:
-        verbose_proxy_logger.exception(
-            "litellm.proxy.anthropic_endpoints.count_tokens(): Exception occurred - {}".format(
-                str(e)
-            )
-        )
-        raise HTTPException(
-            status_code=500, detail={"error": f"Internal server error: {str(e)}"}
-        )
+        log_llm_api_exception(e, litellm_call_id)
+        return _anthropic_error_json_response(proxy_exception_from_route_error(e), request)
+    else:
+        return {"input_tokens": token_response.total_tokens, **count_source_fields(token_response)}
 
 
 @router.post(
