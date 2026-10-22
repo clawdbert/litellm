@@ -54,7 +54,7 @@ services:
       - gateway
     restart: unless-stopped
     healthcheck:
-      # node:20-alpine ships busybox nc; -z confirms TCP listener (ready to accept).
+      # node:24.22.1-alpine ships busybox nc; -z confirms TCP listener (ready to accept).
       # Use 127.0.0.1 explicitly because "localhost" sometimes resolves via IPv6
       # in alpine and auth2api binds IPv4 only.
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8317"]
